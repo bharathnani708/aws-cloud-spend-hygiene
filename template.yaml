@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS cloud spend hygiene - weekly read-only audit of idle and orphaned resources, emailed by region
+
+# Deploy:
+#   aws cloudformation package --template-file template.yaml --s3-bucket <your-artifact-bucket> --output-template-file packaged.yaml
+#   aws cloudformation deploy  --template-file packaged.yaml --stack-name cloud-spend-hygiene \
+#       --capabilities CAPABILITY_IAM --parameter-overrides SesFrom=you@example.com SesTo=team@example.com
+
+Parameters:
+  SesFrom:
+    Type: String
+    Default: ''
+    Description: Verified SES sender address (leave empty to use SNS plain-text email instead)
+  SesTo:
+    Type: String
+    Default: ''
+    Description: Comma-separated recipients (must be verified while SES is in sandbox)
+  NotifyEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Email subscribed to an SNS topic for the plain-text fallback report
+  Regions:
+    Type: String
+    Default: all
+    Description: '"all" or a comma-separated list, e.g. us-east-1,ca-central-1'
+  ReportTitle:
+    Type: String
+    Default: 'AWS Cleanup Review: Unused & Idle Resources'
+  CreateReportBucket:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'true = also keep full CSV reports in a private S3 bucket'
+  MinAgeDays:
+    Type: Number
+    Default: 90
+    Description: Snapshots, AMIs and backups older than this are flagged
+  StoppedDays:
+    Type: Number
+    Default: 30
+    Description: EC2 instances stopped longer than this are flagged
+  IdleLookbackDays:
+    Type: Number
+    Default: 14
+    Description: NAT gateways with no traffic in this many days are flagged
+  ExcludeTagKey:
+    Type: String
+    Default: keep
+    Description: Resources tagged KEY=true are never reported
+  Schedule:
+    Type: String
+    Default: cron(0 12 ? * MON *)
+    Description: EventBridge schedule in UTC. Default is Mondays 12:00 UTC
+
+Conditions:
+  UseBucket: !Equals [!Ref CreateReportBucket, 'true']
+  UseSns: !Not [!Equals [!Ref NotifyEmail, '']]
+
+Resources:
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseBucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-reports
+            Status: Enabled
+            ExpirationInDays: 365
+
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Condition: UseSns
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotifyEmail
+
+  ScannerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: read-only-scan
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOnlyDescribe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeImages
+                  - ec2:DescribeImageAttribute
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeNatGateways
+                  - autoscaling:DescribeLaunchConfigurations
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBSnapshots
+                  - rds:DescribeDBClusterSnapshots
+                  - backup:ListBackupVaults
+                  - backup:ListRecoveryPointsByBackupVault
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTags
+                  - cloudwatch:GetMetricStatistics
+                  - pricing:GetProducts
+                Resource: '*'
+              - Sid: SendReportEmail
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+              - !If
+                - UseBucket
+                - Sid: WriteReports
+                  Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub '${ReportBucket.Arn}/*'
+                - !Ref AWS::NoValue
+              - !If
+                - UseSns
+                - Sid: PublishSummary
+                  Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref ReportTopic
+                - !Ref AWS::NoValue
+
+  ScannerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cloud-spend-hygiene
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt ScannerRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Code: src/
+      Environment:
+        Variables:
+          REGIONS: !Ref Regions
+          REPORT_TITLE: !Ref ReportTitle
+          REPORT_BUCKET: !If [UseBucket, !Ref ReportBucket, !Ref 'AWS::NoValue']
+          SNS_TOPIC_ARN: !If [UseSns, !Ref ReportTopic, !Ref 'AWS::NoValue']
+          SES_FROM: !Ref SesFrom
+          SES_TO: !Ref SesTo
+          MIN_AGE_DAYS: !Ref MinAgeDays
+          STOPPED_DAYS: !Ref StoppedDays
+          IDLE_LOOKBACK_DAYS: !Ref IdleLookbackDays
+          EXCLUDE_TAG_KEY: !Ref ExcludeTagKey
+          EXCLUDE_TAG_VALUE: 'true'
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Weekly cloud spend hygiene scan
+      ScheduleExpression: !Ref Schedule
+      State: ENABLED
+      Targets:
+        - Id: scanner
+          Arn: !GetAtt ScannerFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+Outputs:
+  FunctionName:
+    Value: !Ref ScannerFunction
+  ReportBucketName:
+    Condition: UseBucket
+    Value: !Ref ReportBucket

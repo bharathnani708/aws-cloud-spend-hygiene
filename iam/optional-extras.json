@@ -1,0 +1,16 @@
+{
+  "_comment": "Add ONLY the statements you need. Replace the placeholders. ce:GetCostAndUsage is for SHOW_SPEND=true; Athena/Glue/S3 are for the optional CUR billed-amounts feature; s3:PutObject is for REPORT_BUCKET; sns:Publish is for the plain-text fallback.",
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ShowLastMonthSpend", "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" },
+    { "Sid": "CsvToS3", "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::YOUR-REPORT-BUCKET/*" },
+    { "Sid": "SnsFallback", "Effect": "Allow", "Action": "sns:Publish", "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:YOUR-TOPIC" },
+    { "Sid": "CurAthena", "Effect": "Allow",
+      "Action": ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+                 "glue:GetDatabase", "glue:GetTable", "glue:GetPartitions"], "Resource": "*" },
+    { "Sid": "CurBucketRead", "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::YOUR-CUR-BUCKET", "arn:aws:s3:::YOUR-CUR-BUCKET/*"] },
+    { "Sid": "AthenaResults", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::YOUR-ATHENA-RESULTS-BUCKET", "arn:aws:s3:::YOUR-ATHENA-RESULTS-BUCKET/*"] }
+  ]
+}
